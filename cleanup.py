@@ -7,7 +7,6 @@ Make executable with: chmod +x cleanup.py
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import os
 import re
 import shutil
@@ -37,7 +36,8 @@ HOME = Path.home()
 DEFAULT_CONFIG_PATH = HOME / ".config" / "cleanup" / "config.toml"
 DEFAULT_LOG_PATH = HOME / ".local" / "share" / "cleanup" / "cleanup.log"
 DEPENDENCIES = ["fzf", "paccache", "journalctl", "fdupes", "dust"]
-JUNK_PATTERNS = [".DS_Store", "Thumbs.db", "desktop.ini", "*.orig", "*.bak", "*~"]
+JUNK_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+JUNK_SUFFIXES = (".orig", ".bak", "~")
 
 
 @dataclass
@@ -67,6 +67,7 @@ class Context:
     missing_bins: set[str] = field(default_factory=set)
     noatime_home: bool = False
     sudo_retry_all: bool = False
+    home_scan_cache: tuple[list[Path], list[Path]] | None = None
 
     def print(self, message: str = "") -> None:
         if not self.quiet:
@@ -159,6 +160,38 @@ def parse_human_size(text: str) -> int:
         "PB": 1024**5,
     }
     return int(value * scale.get(unit, 1))
+
+
+def measure_journal_size(ctx: Context) -> int:
+    if "journalctl" in ctx.missing_bins:
+        return 0
+    usage = run_command(ctx, ["journalctl", "--disk-usage"], reason="journal usage")
+    if usage.returncode != 0:
+        return 0
+    return parse_human_size(usage.stdout)
+
+
+def estimate_paccache_reclaimable(ctx: Context, cache_dir: Path) -> int:
+    if "paccache" in ctx.missing_bins:
+        return 0
+    proc = run_command(
+        ctx,
+        ["paccache", "-dvvzk2"],
+        reason="paccache dry-run estimate",
+    )
+    if proc.returncode != 0:
+        return 0
+
+    total = 0
+    for raw in proc.stdout.split("\0"):
+        candidate = raw.strip()
+        if not candidate or candidate.startswith("==>"):
+            continue
+        path = Path(candidate)
+        if not path.is_absolute():
+            path = cache_dir / candidate
+        total += path_size(path)
+    return total
 
 
 def fmt_date(ts: datetime) -> str:
@@ -389,33 +422,42 @@ def print_log_tail(log_path: Path, lines: int = 20) -> None:
         print(line)
 
 
-def is_broken_symlink(path: Path) -> bool:
-    try:
-        return path.is_symlink() and not path.exists()
-    except OSError:
-        return False
+def is_junk_name(name: str) -> bool:
+    return name in JUNK_NAMES or name.endswith(JUNK_SUFFIXES)
 
 
-def scan_junk_files() -> list[Path]:
-    matches: list[Path] = []
-    for root, dirs, files in os.walk(HOME, topdown=True, onerror=None):
-        dirs[:] = [name for name in dirs if name != ".git"]
-        for name in files:
-            if any(fnmatch.fnmatch(name, pattern) for pattern in JUNK_PATTERNS):
-                matches.append(Path(root) / name)
-    return matches
+def scan_home_for_junk_and_symlinks(ctx: Context) -> tuple[list[Path], list[Path]]:
+    if ctx.home_scan_cache is not None:
+        return ctx.home_scan_cache
 
+    junk_matches: list[Path] = []
+    broken_matches: list[Path] = []
 
-def scan_broken_symlinks() -> list[Path]:
-    matches: list[Path] = []
-    for root, dirs, files in os.walk(HOME, topdown=True, followlinks=False):
-        dirs[:] = [name for name in dirs if name != ".git"]
-        root_path = Path(root)
-        for name in list(dirs) + files:
-            candidate = root_path / name
-            if is_broken_symlink(candidate):
-                matches.append(candidate)
-    return matches
+    def walk_dir(root: str) -> None:
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if entry.name == ".git" and entry.is_dir(follow_symlinks=False):
+                        continue
+                    try:
+                        if entry.is_symlink() and not os.path.exists(entry.path):
+                            broken_matches.append(Path(entry.path))
+                            continue
+                        if entry.is_file(follow_symlinks=False):
+                            if is_junk_name(entry.name):
+                                junk_matches.append(Path(entry.path))
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            walk_dir(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            return
+
+    walk_dir(str(HOME))
+
+    ctx.home_scan_cache = (junk_matches, broken_matches)
+    return ctx.home_scan_cache
 
 
 def scan_empty_dirs() -> list[Path]:
@@ -541,11 +583,14 @@ def clean_static(ctx: Context) -> None:
 
     if categories.get("pacman", True):
         pacman_cache = Path("/var/cache/pacman/pkg")
-        size = path_size(pacman_cache) if pacman_cache.exists() else 0
-        print_category_summary(ctx, "pacman", size, "(paccache -rk2)")
-        if skip_zero_size(ctx, "pacman", size):
+        total_cache_size = path_size(pacman_cache) if pacman_cache.exists() else 0
+        reclaimable_size = estimate_paccache_reclaimable(ctx, pacman_cache)
+        note = f"(paccache -rk2, cache total {human_size(total_cache_size)})"
+        print_category_summary(ctx, "pacman", reclaimable_size, note)
+        if skip_zero_size(ctx, "pacman", reclaimable_size):
             pass
         elif prompt_yes_no(ctx, "  [pacman] clean?"):
+            before_size = path_size(pacman_cache)
             proc = run_command(
                 ctx,
                 ["paccache", "-rk2"],
@@ -554,11 +599,12 @@ def clean_static(ctx: Context) -> None:
                 destructive=True,
             )
             if proc.returncode == 0:
-                ctx.stats.freed += size
-                label = "Would free" if ctx.dry_run else "Freed"
-                ctx.print(f"{GREEN}  ✓ {label} {human_size(size)}{RESET}")
+                freed = reclaimable_size if ctx.dry_run else max(0, before_size - path_size(pacman_cache))
+                ctx.stats.freed += freed
+                label = "Would free up to" if ctx.dry_run else "Freed"
+                ctx.print(f"{GREEN}  ✓ {label} {human_size(freed)}{RESET}")
         else:
-            ctx.stats.skipped += size
+            ctx.stats.skipped += reclaimable_size
             ctx.print(f"{YELLOW}  - Skipped pacman cache{RESET}")
 
         orphans = run_command(ctx, ["pacman", "-Qdtq"], reason="pacman orphan scan")
@@ -612,18 +658,23 @@ def clean_static(ctx: Context) -> None:
                 st = safe_lstat(candidate)
                 if st and st.st_mtime < cutoff:
                     old_logs.append(candidate)
-        journal_size = 0
-        if "journalctl" not in ctx.missing_bins:
-            usage = run_command(ctx, ["journalctl", "--disk-usage"], reason="journal usage")
-            if usage.returncode == 0:
-                journal_size = parse_human_size(usage.stdout)
-        total = sum(path_size(path) for path in old_logs) + journal_size
-        print_category_summary(ctx, "logs", total, "(journalctl + old *.log)")
-        if skip_zero_size(ctx, "logs", total):
-            pass
+        journal_size = measure_journal_size(ctx)
+        old_logs_size = sum(path_size(path) for path in old_logs)
+        reclaimable_estimate = old_logs_size
+        journal_note = (
+            "journal empty"
+            if journal_size == 0
+            else f"journal current {human_size(journal_size)}, reclaim unknown"
+        )
+        note = f"(old *.log {human_size(old_logs_size)}; {journal_note})"
+        print_category_summary(ctx, "logs", reclaimable_estimate, note)
+        should_offer_logs = old_logs_size > 0 or journal_size > 0
+        if not should_offer_logs:
+            ctx.print(f"{YELLOW}  - Skipped logs: nothing to free{RESET}")
         elif prompt_yes_no(ctx, "  [logs] clean?"):
             freed = 0
-            if "journalctl" not in ctx.missing_bins:
+            if "journalctl" not in ctx.missing_bins and journal_size > 0:
+                before_journal_size = journal_size
                 proc = run_command(
                     ctx,
                     ["journalctl", "--vacuum-time=7d"],
@@ -631,7 +682,10 @@ def clean_static(ctx: Context) -> None:
                     destructive=True,
                 )
                 if proc.returncode == 0:
-                    freed += journal_size
+                    if ctx.dry_run:
+                        freed += 0
+                    else:
+                        freed += max(0, before_journal_size - measure_journal_size(ctx))
             for item in old_logs:
                 size, ok = delete_path(ctx, item, "static:old-log")
                 if ok:
@@ -640,7 +694,7 @@ def clean_static(ctx: Context) -> None:
             label = "Would free" if ctx.dry_run else "Freed"
             ctx.print(f"{GREEN}  ✓ {label} {human_size(freed)}{RESET}")
         else:
-            ctx.stats.skipped += total
+            ctx.stats.skipped += reclaimable_estimate
             ctx.print(f"{YELLOW}  - Skipped logs{RESET}")
 
     if categories.get("trash", True):
@@ -668,8 +722,12 @@ def clean_static(ctx: Context) -> None:
             if total:
                 ctx.print(f"{YELLOW}  - Skipped trash{RESET}")
 
+    junk_files: list[Path] = []
+    broken: list[Path] = []
+    if categories.get("junk", True) or categories.get("symlinks", True):
+        junk_files, broken = scan_home_for_junk_and_symlinks(ctx)
+
     if categories.get("junk", True):
-        junk_files = scan_junk_files()
         total = sum(path_size(path) for path in junk_files)
         print_category_summary(ctx, "junk_files", total, f"({len(junk_files)} matches)")
         if skip_zero_size(ctx, "junk_files", total):
@@ -688,7 +746,6 @@ def clean_static(ctx: Context) -> None:
             ctx.print(f"{YELLOW}  - Skipped junk files{RESET}")
 
     if categories.get("symlinks", True):
-        broken = scan_broken_symlinks()
         total = sum(path_size(path) for path in broken)
         print_category_summary(ctx, "broken_symlinks", total, f"({len(broken)} links)")
         if broken and total > 0:
@@ -962,13 +1019,15 @@ def print_final_summary(ctx: Context) -> None:
     log_display = str(ctx.log_path).replace(str(HOME), "~")
     width = max(29, len(log_display) + 10)
     inner = width - 2
+    freed_label = "Would free" if ctx.dry_run else "Freed"
+
     def box_line(content: str) -> str:
         return f"│{content:<{inner}}│"
 
     lines = [
         "┌" + "─" * inner + "┐",
         box_line("  cleanup complete"),
-        box_line(f"  Freed:     {human_size(ctx.stats.freed)}"),
+        box_line(f"  {freed_label}:     {human_size(ctx.stats.freed)}"),
         box_line(f"  Skipped:   {human_size(ctx.stats.skipped)}"),
         box_line(f"  Errors:    {ctx.stats.errors}"),
         box_line(f"  Log:  {log_display}"),
